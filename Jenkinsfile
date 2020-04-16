@@ -1,3 +1,5 @@
+def pipelineVersion='1.1.1'
+println "Pipeline version: ${pipelineVersion}"
 /*
  * This is a vanilla Jenkins pipeline that relies on the Jenkins kubernetes plugin to dynamically provision agents for
  * the build containers.
@@ -75,11 +77,13 @@ spec:
             secretKeyRef:
               name: git-credentials
               key: username
+              optional: true
         - name: GIT_AUTH_PWD
           valueFrom:
             secretKeyRef:
               name: git-credentials
               key: password
+              optional: true
     - name: buildah
       image: quay.io/buildah/stable:v1.9.0
       tty: true
@@ -151,6 +155,8 @@ spec:
           value: /home/devops
         - name: ENVIRONMENT_NAME
           value: ${env.NAMESPACE}
+        - name: BRANCH
+          value: ${branch}
     - name: trigger-cd
       image: docker.io/garagecatalyst/ibmcloud-dev:1.0.10
       tty: true
@@ -173,7 +179,7 @@ spec:
             checkout scm
             stage('Build') {
                 sh '''#!/bin/bash
-                    npm install
+                    npm install --unsafe-perm
                     npm run build --if-present
                 '''
             }
@@ -208,13 +214,32 @@ spec:
                     set -x
                     set -e
 
-                    git fetch origin ${BRANCH} --tags
-                    git checkout ${BRANCH}
+                    if [[ -z "$GIT_AUTH_USER" ]] || [[ -z "$GIT_AUTH_PWD" ]]; then
+                      echo "Git credentials not found. The pipeline expects to find them in a secret named 'git-credentials'."
+                      echo "  Update your CLI and register the pipeline again"
+                      exit 1
+                    fi
+
+                    git config --local credential.helper "!f() { echo username=\\$GIT_AUTH_USER; echo password=\\$GIT_AUTH_PWD; }; f"
+
+                    git fetch
+                    git fetch --tags
+                    git tag -l
+
+                    git checkout -b ${BRANCH} --track origin/${BRANCH}
                     git branch --set-upstream-to=origin/${BRANCH} ${BRANCH}
 
                     git config --global user.name "Jenkins Pipeline"
                     git config --global user.email "jenkins@ibmcloud.com"
-                    git config --local credential.helper "!f() { echo username=\\$GIT_AUTH_USER; echo password=\\$GIT_AUTH_PWD; }; f"
+
+                    if [[ "${BRANCH}" == "master" ]] && [[ $(git describe --tag `git rev-parse HEAD`) =~ (^[0-9]+.[0-9]+.[0-9]+$) ]] || \
+                       [[ $(git describe --tag `git rev-parse HEAD`) =~ (^[0-9]+.[0-9]+.[0-9]+-${BRANCH}[.][0-9]+$) ]]
+                    then
+                        echo "Latest commit is already tagged"
+                        echo "IMAGE_NAME=$(basename -s .git `git config --get remote.origin.url` | tr '[:upper:]' '[:lower:]' | sed 's/_/-/g')" > ./env-config
+                        echo "IMAGE_VERSION=$(git describe --abbrev=0 --tags)" >> ./env-config
+                        exit 0
+                    fi
 
                     mkdir -p ~/.npm
                     npm config set prefix ~/.npm
@@ -228,12 +253,16 @@ spec:
                     release-it patch ${PRE_RELEASE} \
                       --ci \
                       --no-npm \
+                      --no-git.push \
                       --no-git.requireCleanWorkingDir \
                       --verbose \
                       -VV
 
+                    git push --follow-tags -v
+
                     echo "IMAGE_VERSION=$(git describe --abbrev=0 --tags)" > ./env-config
                     echo "IMAGE_NAME=$(basename -s .git `git config --get remote.origin.url` | tr '[:upper:]' '[:lower:]' | sed 's/_/-/g')" >> ./env-config
+                    echo "REPO_URL=$(git config --get remote.origin.url)" >> ./env-config
 
                     cat ./env-config
                 '''
@@ -304,6 +333,8 @@ spec:
                     cat ${CHART_PATH}/values.yaml | \
                         yq w - nameOverride "${IMAGE_NAME}" | \
                         yq w - fullnameOverride "${IMAGE_NAME}" | \
+                        yq w - vcsInfo.repoUrl "${REPO_URL}" | \
+                        yq w - vcsInfo.branch "${BRANCH}" | \
                         yq w - image.repository "${IMAGE_REPOSITORY}" | \
                         yq w - image.tag "${IMAGE_VERSION}" | \
                         yq w - ingress.enabled "${INGRESS_ENABLED}" | \
@@ -333,20 +364,25 @@ spec:
                         ROUTE_HOST=$(kubectl get route/${IMAGE_NAME} --namespace ${ENVIRONMENT_NAME} --output=jsonpath='{ .spec.host }')
                         URL="https://${ROUTE_HOST}"
                     else
-                        INGRESS_HOST=$(kubectl get ingress/${IMAGE_NAME} --namespace ${ENVIRONMENT_NAME} --output=jsonpath='{ .spec.rules[0].host }')
+                        INGRESS_HOST=$(kubectl get ingress.networking.k8s.io/${IMAGE_NAME} --namespace ${ENVIRONMENT_NAME} --output=jsonpath='{ .spec.rules[0].host }')
                         URL="http://${INGRESS_HOST}"
                     fi
 
-                    # sleep for 10 seconds to allow enough time for the server to start
-                    sleep 30
+                    sleep_countdown=5
 
-                    if [[ $(curl -sL -w "%{http_code}\\n" "${URL}/health" -o /dev/null --connect-timeout 3 --max-time 5 --retry 3 --retry-max-time 30) == "200" ]]; then
-                        echo "Successfully reached health endpoint: ${URL}/health"
-                        echo "====================================================================="
-                    else
-                        echo "Could not reach health endpoint: ${URL}/health"
-                        exit 1;
-                    fi;
+                    # sleep for 10 seconds to allow enough time for the server to start
+                    sleep 10
+                    while [ $(curl -sL -w "%{http_code}\\n" "${URL}/health" -o /dev/null --connect-timeout 3 --max-time 5 --retry 3 --retry-max-time 30) != "200" ]; do
+                        sleep 30
+                        sleep_countdown=$((sleep_countdown-1))
+                        if [ sleep_countdown=0 ]; then
+                                echo "Could not reach health endpoint: ${URL}/health"
+                                exit 1;
+                        fi
+                    done
+
+                    echo "Successfully reached health endpoint: ${URL}/health"
+                    echo "====================================================================="
                 '''
             }
             stage('Package Helm Chart') {
@@ -360,7 +396,7 @@ spec:
                 . ./env-config
 
                 if [[ -z "${ARTIFACTORY_ENCRYPT}" ]]; then
-                    echo "Encrption key not available for Jenkins pipeline, please add it to the artifactory-access"
+                    echo "It looks like your Artifactory installation is not complete. Please complete the steps found here - http://ibm.biz/complete-setup"
                     exit 1
                 fi
 
